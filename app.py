@@ -32,14 +32,15 @@ BAND_ITEMS = [
     ("CB", 7),
 ]
 
+# All user-facing frequency units are MHz
 BAND_MAPPING = {
-    1: (2.4, 2.5),
-    2: (5.15, 5.85),
-    3: (5.925, 7.125),
-    4: (5.925, 6.425),
-    5: (0.617, 0.96),
-    6: (1.71, 2.7),
-    7: (3.3, 4.2),
+    1: (2400, 2500),
+    2: (5150, 5850),
+    3: (5925, 7125),
+    4: (5925, 6425),
+    5: (617, 960),
+    6: (1710, 2700),
+    7: (3300, 4200),
 }
 
 
@@ -88,7 +89,29 @@ def find_freq_column(df):
     raise ValueError("找不到 Frequency 欄位")
 
 
-def load_csv_freq_s21_only(path, start_ghz, end_ghz, display_name=None):
+def convert_freq_series_to_mhz(freq_series):
+    """
+    Convert frequency values to MHz.
+    Heuristic:
+      - values > 1e6 are assumed Hz -> /1e6
+      - values > 1e3 are assumed MHz already
+      - otherwise assumed GHz -> *1000
+    """
+    s = pd.to_numeric(freq_series, errors="coerce")
+    med = np.nanmedian(s.to_numpy()) if len(s) else np.nan
+
+    if np.isnan(med):
+        return s
+
+    if med > 1e6:
+        return s / 1e6
+    elif med > 1e3:
+        return s
+    else:
+        return s * 1000
+
+
+def load_csv_freq_s21_only(path, start_mhz, end_mhz, display_name=None):
     skip, enc = find_csv_data_start(path)
     try:
         df = pd.read_csv(path, skiprows=skip, encoding=enc)
@@ -100,9 +123,9 @@ def load_csv_freq_s21_only(path, start_ghz, end_ghz, display_name=None):
         and str(df.columns[0]).strip() == "Freq(Hz)"
         and str(df.columns[3]).strip() == "S21 Log Mag(dB)"
     ):
-        freq = pd.to_numeric(df[df.columns[0]], errors="coerce") / 1e9
+        freq = pd.to_numeric(df[df.columns[0]], errors="coerce") / 1e6
         s21 = pd.to_numeric(df[df.columns[3]], errors="coerce")
-        sel = (freq >= start_ghz) & (freq <= end_ghz)
+        sel = (freq >= start_mhz) & (freq <= end_mhz)
         result = pd.DataFrame({
             "Freq": freq[sel],
             "S21 Log Mag(dB)": s21[sel]
@@ -115,7 +138,7 @@ def load_csv_freq_s21_only(path, start_ghz, end_ghz, display_name=None):
     return None
 
 
-def load_csv_files(uploaded_files, start_ghz, end_ghz, is_isolation=False):
+def load_csv_files(uploaded_files, start_mhz, end_mhz, is_isolation=False):
     series_list = []
     temp_paths = []
 
@@ -126,7 +149,7 @@ def load_csv_files(uploaded_files, start_ghz, end_ghz, is_isolation=False):
 
             if is_isolation:
                 special_df = load_csv_freq_s21_only(
-                    path, start_ghz, end_ghz, display_name=uf.name
+                    path, start_mhz, end_mhz, display_name=uf.name
                 )
                 if special_df is not None:
                     series_list.append(
@@ -141,11 +164,12 @@ def load_csv_files(uploaded_files, start_ghz, end_ghz, is_isolation=False):
                 df = pd.read_csv(path, skiprows=skip, encoding="latin1")
 
             freq_col = find_freq_column(df)
-            df[freq_col] = pd.to_numeric(df[freq_col], errors="coerce") / 1e9
+            df[freq_col] = convert_freq_series_to_mhz(df[freq_col])
+
             df = df.rename(columns={freq_col: "Freq"}).dropna(subset=["Freq"])
             df = df.set_index("Freq").sort_index()
 
-            df_sel = df.loc[start_ghz:end_ghz]
+            df_sel = df.loc[start_mhz:end_mhz]
             df_sel = df_sel[~df_sel.index.duplicated(keep="first")]
 
             if df_sel.shape[1] < 1:
@@ -180,6 +204,12 @@ def read_combined_uploaded(uploaded_file):
             df = pd.read_csv(io.BytesIO(raw), index_col=0, encoding=enc)
             df.index = pd.to_numeric(df.index, errors="coerce")
             df = df.loc[~df.index.isna()].sort_index()
+
+            # Combined CSV may come from older GHz-based version.
+            idx = pd.Series(df.index.to_numpy())
+            idx_mhz = convert_freq_series_to_mhz(idx)
+            df.index = idx_mhz.to_numpy()
+
             df.index.name = "Freq"
             return sanitize_df_columns(df)
         except Exception as e:
@@ -342,7 +372,7 @@ def plot_filtered_chart_with_bands(
             left=0.08, right=0.98, top=0.90, bottom=0.10
         )
 
-    freq_mhz = df.index.to_numpy() * 1000
+    freq_mhz = df.index.to_numpy()
     colors = itertools.cycle(
         plt.rcParams["axes.prop_cycle"].by_key()["color"]
     )
@@ -363,8 +393,8 @@ def plot_filtered_chart_with_bands(
         for s, e, val in spec:
             ax.hlines(
                 val,
-                s * 1000,
-                e * 1000,
+                s,
+                e,
                 color="red",
                 linestyle="--",
             )
@@ -397,8 +427,8 @@ def plot_filtered_chart_with_bands(
     for s, e in (band_ranges or []):
         ax.add_patch(
             patches.Rectangle(
-                (s * 1000, y0),
-                (e - s) * 1000,
+                (s, y0),
+                (e - s),
                 y1 - y0,
                 color=next(rects),
                 alpha=0.25,
@@ -477,8 +507,7 @@ st.set_page_config(
 st.title("📡 RL / VSWR / Isolation")
 
 st.caption(
-    "Upload CSV files, set frequency / SPEC / band / Y-axis parameters, "
-    "preview plots, and download PNG or combined CSV."
+    "所有頻率設定皆使用 MHz。上傳 CSV 後可預覽並下載圖表與 Combined CSV。"
 )
 
 # Session state
@@ -503,26 +532,18 @@ st.subheader("1. 模式")
 
 mode = st.radio(
     "選擇模式",
-    ["Return Loss / VSWR", "Isolation"],
+    [
+        "Return Loss",
+        "VSWR",
+        "Return Loss + VSWR",
+        "Isolation",
+    ],
     horizontal=True,
 )
 
-if mode == "Return Loss / VSWR":
-    c1, c2 = st.columns(2)
-    with c1:
-        do_s11 = st.checkbox("Return Loss", value=True)
-    with c2:
-        do_vswr = st.checkbox("VSWR", value=True)
-    do_iso = False
-else:
-    do_s11 = False
-    do_vswr = False
-    do_iso = True
-
-separate_legend = st.checkbox(
-    "獨立顯示圖例",
-    value=False,
-)
+do_s11 = mode in ("Return Loss", "Return Loss + VSWR")
+do_vswr = mode in ("VSWR", "Return Loss + VSWR")
+do_iso = mode == "Isolation"
 
 
 # ============================================================
@@ -545,22 +566,24 @@ if uploaded_files:
 # ============================================================
 # 3. Frequency range
 # ============================================================
-st.subheader("3. 頻率範圍 (GHz)")
+st.subheader("3. 頻率範圍 (MHz)")
 
 fc1, fc2 = st.columns(2)
 
 with fc1:
     fstart = st.number_input(
-        "Start (GHz)",
-        value=0.617,
-        format="%.3f",
+        "Start (MHz)",
+        value=5925.0,
+        step=1.0,
+        format="%.0f",
     )
 
 with fc2:
     fend = st.number_input(
-        "End (GHz)",
-        value=7.125,
-        format="%.3f",
+        "End (MHz)",
+        value=7125.0,
+        step=1.0,
+        format="%.0f",
     )
 
 
@@ -569,33 +592,34 @@ with fc2:
 # ============================================================
 st.subheader("4. SPEC 分段")
 
-st.caption("最多 5 組，格式為 Start GHz / End GHz / dB。")
-
 spec_rows = []
 
-for i in range(5):
-    c1, c2, c3 = st.columns(3)
+with st.expander("自訂 SPEC（選填）", expanded=False):
+    st.caption("最多 5 組，單位皆為 MHz / dB。")
 
-    with c1:
-        s = st.text_input(
-            f"SPEC {i+1} Start",
-            key=f"spec_start_{i}",
-        )
+    for i in range(5):
+        c1, c2, c3 = st.columns(3)
 
-    with c2:
-        e = st.text_input(
-            f"SPEC {i+1} End",
-            key=f"spec_end_{i}",
-        )
+        with c1:
+            s = st.text_input(
+                f"SPEC {i+1} Start (MHz)",
+                key=f"spec_start_{i}",
+            )
 
-    with c3:
-        v = st.text_input(
-            f"SPEC {i+1} dB",
-            key=f"spec_val_{i}",
-        )
+        with c2:
+            e = st.text_input(
+                f"SPEC {i+1} End (MHz)",
+                key=f"spec_end_{i}",
+            )
 
-    if s.strip() and e.strip() and v.strip():
-        spec_rows.append((s.strip(), e.strip(), v.strip()))
+        with c3:
+            v = st.text_input(
+                f"SPEC {i+1} dB",
+                key=f"spec_val_{i}",
+            )
+
+        if s.strip() and e.strip() and v.strip():
+            spec_rows.append((s.strip(), e.strip(), v.strip()))
 
 
 # ============================================================
@@ -610,65 +634,128 @@ selected_band_names = st.multiselect(
     options=list(band_name_to_code.keys()),
 )
 
-st.caption("也可以另外輸入最多 5 組手動頻段。")
-
 manual_ranges_text = []
 
-for i in range(5):
-    c1, c2 = st.columns(2)
+with st.expander("手動頻段（選填）", expanded=False):
+    st.caption("最多 5 組，單位皆為 MHz。")
 
-    with c1:
-        s = st.text_input(
-            f"Manual {i+1} Start (GHz)",
-            key=f"manual_start_{i}",
-        )
+    for i in range(5):
+        c1, c2 = st.columns(2)
 
-    with c2:
-        e = st.text_input(
-            f"Manual {i+1} End (GHz)",
-            key=f"manual_end_{i}",
-        )
+        with c1:
+            s = st.text_input(
+                f"Manual {i+1} Start (MHz)",
+                key=f"manual_start_{i}",
+            )
 
-    if s.strip() and e.strip():
-        manual_ranges_text.append((s.strip(), e.strip()))
+        with c2:
+            e = st.text_input(
+                f"Manual {i+1} End (MHz)",
+                key=f"manual_end_{i}",
+            )
+
+        if s.strip() and e.strip():
+            manual_ranges_text.append((s.strip(), e.strip()))
 
 
 # ============================================================
-# 6. Y axis
+# 6. Y axis - mode-aware
 # ============================================================
 st.subheader("6. Y 軸設定")
 
-y1, y2, y3 = st.columns(3)
+# Defaults even when widgets are hidden
+s11_ymin = ""
+s11_ymax = ""
+s11_ystep = "5"
+vswr_ymin = "1"
+vswr_ymax = ""
+vswr_ystep = "1"
+iso_ymin = ""
+iso_ymax = ""
+iso_ystep = "5"
 
-with y1:
-    st.markdown("**Return Loss**")
-    s11_ymin = st.text_input("Ymin", key="s11_ymin")
-    s11_ymax = st.text_input("Ymax", key="s11_ymax")
-    s11_ystep = st.text_input("Step", value="5", key="s11_ystep")
+with st.expander("自訂 Y 軸 Scale（選填）", expanded=False):
 
-with y2:
-    st.markdown("**VSWR**")
-    vswr_ymin = st.text_input("Ymin", value="1", key="vswr_ymin")
-    vswr_ymax = st.text_input("Ymax", key="vswr_ymax")
-    vswr_ystep = st.text_input("Step", value="1", key="vswr_ystep")
+    if do_s11:
+        st.markdown("**Return Loss**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            s11_ymin = st.text_input(
+                "Ymin",
+                key="s11_ymin",
+            )
+        with c2:
+            s11_ymax = st.text_input(
+                "Ymax",
+                key="s11_ymax",
+            )
+        with c3:
+            s11_ystep = st.text_input(
+                "Step",
+                value="5",
+                key="s11_ystep",
+            )
 
-with y3:
-    st.markdown("**Isolation**")
-    iso_ymin = st.text_input("Ymin", key="iso_ymin")
-    iso_ymax = st.text_input("Ymax", key="iso_ymax")
-    iso_ystep = st.text_input("Step", value="5", key="iso_ystep")
+    if do_vswr:
+        if do_s11:
+            st.divider()
+        st.markdown("**VSWR**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            vswr_ymin = st.text_input(
+                "Ymin ",
+                value="1",
+                key="vswr_ymin",
+            )
+        with c2:
+            vswr_ymax = st.text_input(
+                "Ymax ",
+                key="vswr_ymax",
+            )
+        with c3:
+            vswr_ystep = st.text_input(
+                "Step ",
+                value="1",
+                key="vswr_ystep",
+            )
+
+    if do_iso:
+        st.markdown("**Isolation**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            iso_ymin = st.text_input(
+                "Ymin",
+                key="iso_ymin",
+            )
+        with c2:
+            iso_ymax = st.text_input(
+                "Ymax",
+                key="iso_ymax",
+            )
+        with c3:
+            iso_ystep = st.text_input(
+                "Step",
+                value="5",
+                key="iso_ystep",
+            )
 
 
 # ============================================================
-# 7. Cleaning
+# 7. Advanced
 # ============================================================
-st.subheader("7. 資料範圍")
+st.subheader("7. 進階設定")
 
-clean_non_band = st.checkbox(
-    "清除非頻段範圍",
-    value=False,
-    help="勾選後，未落在所選 Band / Manual Band 的資料會變成空值。",
-)
+with st.expander("展開進階設定", expanded=False):
+    separate_legend = st.checkbox(
+        "獨立顯示圖例",
+        value=False,
+    )
+
+    clean_non_band = st.checkbox(
+        "清除非頻段範圍",
+        value=False,
+        help="勾選後，未落在所選 Band / Manual Band 的資料會變成空值。",
+    )
 
 
 # ============================================================
@@ -695,9 +782,6 @@ if run:
 
         if fstart >= fend:
             raise ValueError("Start 必須小於 End。")
-
-        if not do_s11 and not do_vswr and not do_iso:
-            raise ValueError("請至少選擇一個模式。")
 
         # SPEC
         specs = []
@@ -769,17 +853,18 @@ if run:
 
         inline_legend = not separate_legend
 
-        # Convert RL spec to VSWR spec
+        # Convert RL spec to VSWR spec only if VSWR mode is active
         seg_vswr = []
-        for s, e, v in specs:
-            mag = 10 ** (v / 20)
-            if mag >= 1:
-                raise ValueError(
-                    f"SPEC {v} dB 無法轉成有效 VSWR。Return Loss dB 應小於 0。"
+        if do_vswr:
+            for s, e, v in specs:
+                mag = 10 ** (v / 20)
+                if mag >= 1:
+                    raise ValueError(
+                        f"SPEC {v} dB 無法轉成有效 VSWR。Return Loss dB 應小於 0。"
+                    )
+                seg_vswr.append(
+                    (s, e, (1 + mag) / (1 - mag))
                 )
-            seg_vswr.append(
-                (s, e, (1 + mag) / (1 - mag))
-            )
 
         if do_iso:
             fig, h, lb = plot_filtered_chart_with_bands(
@@ -787,7 +872,7 @@ if run:
                 "Isolation",
                 specs,
                 band_ranges,
-                xlim=(fstart * 1000, fend * 1000),
+                xlim=(fstart, fend),
                 y_step=iso_ystep_f,
                 y_min=iso_ymin_f,
                 y_max=iso_ymax_f,
@@ -812,7 +897,7 @@ if run:
                     "Return Loss",
                     specs,
                     band_ranges,
-                    xlim=(fstart * 1000, fend * 1000),
+                    xlim=(fstart, fend),
                     y_step=s11_ystep_f,
                     y_min=s11_ymin_f,
                     y_max=s11_ymax_f,
@@ -838,7 +923,7 @@ if run:
                     "VSWR",
                     seg_vswr,
                     band_ranges,
-                    xlim=(fstart * 1000, fend * 1000),
+                    xlim=(fstart, fend),
                     y_step=vswr_ystep_f,
                     y_min=vswr_ymin_f if vswr_ymin_f is not None else 1,
                     y_max=vswr_ymax_f,
