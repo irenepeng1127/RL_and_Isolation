@@ -43,6 +43,15 @@ BAND_MAPPING = {
     7: (3300, 4200),
 }
 
+# Preset choices for the Isolation source column selector
+ISO_COLUMN_PRESETS = [
+    "S12 Log Mag(dB)",
+    "S21 Log Mag(dB)",
+    "S11 Log Mag(dB)",
+    "S22 Log Mag(dB)",
+    "自訂...",
+]
+
 
 # ============================================================
 # Helpers
@@ -111,50 +120,72 @@ def convert_freq_series_to_mhz(freq_series):
         return s * 1000
 
 
-def load_csv_freq_s21_only(path, start_mhz, end_mhz, display_name=None):
+def load_csv_freq_target_col(path, start_mhz, end_mhz, target_keyword, display_name=None):
+    """
+    依欄位名稱關鍵字（例如 'S12 Log Mag'）尋找對應的資料欄，
+    避免因為網路分析儀存檔的欄位順序不同而抓錯 trace
+    （例如 Isolation 誤抓到 S11 而不是 S12）。
+
+    回傳 None 代表該檔案沒有符合關鍵字的欄位（呼叫端可決定要 fallback 或報錯）。
+    """
     skip, enc = find_csv_data_start(path)
     try:
         df = pd.read_csv(path, skiprows=skip, encoding=enc)
     except Exception:
         df = pd.read_csv(path, skiprows=skip, encoding="latin1")
 
-    if (
-        len(df.columns) >= 4
-        and str(df.columns[0]).strip() == "Freq(Hz)"
-        and str(df.columns[3]).strip() == "S21 Log Mag(dB)"
-    ):
-        freq = pd.to_numeric(df[df.columns[0]], errors="coerce") / 1e6
-        s21 = pd.to_numeric(df[df.columns[3]], errors="coerce")
-        sel = (freq >= start_mhz) & (freq <= end_mhz)
-        result = pd.DataFrame({
-            "Freq": freq[sel],
-            "S21 Log Mag(dB)": s21[sel]
-        }).dropna()
-        result = result.set_index("Freq").sort_index()
-        label = strip_ext_label(display_name or path)
-        result.columns = [label]
-        return result
+    freq_col = None
+    target_col = None
+    kw = target_keyword.strip().lower()
 
-    return None
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if freq_col is None and "freq" in cl:
+            freq_col = c
+        if target_col is None and kw in cl:
+            target_col = c
+
+    if freq_col is None or target_col is None:
+        return None
+
+    freq = convert_freq_series_to_mhz(pd.to_numeric(df[freq_col], errors="coerce"))
+    val = pd.to_numeric(df[target_col], errors="coerce")
+    sel = (freq >= start_mhz) & (freq <= end_mhz)
+
+    result = pd.DataFrame({"Freq": freq[sel], "val": val[sel]}).dropna()
+    result = result.set_index("Freq").sort_index()
+    label = strip_ext_label(display_name or path)
+    result.columns = [label]
+    return result
 
 
-def load_csv_files(uploaded_files, start_mhz, end_mhz, is_isolation=False):
+def load_csv_files(
+    uploaded_files,
+    start_mhz,
+    end_mhz,
+    is_isolation=False,
+    target_col_keyword=None,
+):
     series_list = []
     temp_paths = []
+    missing_files = []
 
     try:
         for uf in uploaded_files:
             path = uploaded_to_temp(uf)
             temp_paths.append(path)
 
-            if is_isolation:
-                special_df = load_csv_freq_s21_only(
-                    path, start_mhz, end_mhz, display_name=uf.name
+            if is_isolation and target_col_keyword:
+                special_df = load_csv_freq_target_col(
+                    path, start_mhz, end_mhz, target_col_keyword, display_name=uf.name
                 )
                 if special_df is not None:
                     series_list.append(
                         special_df.iloc[:, 0].rename(strip_ext_label(uf.name))
                     )
+                    continue
+                else:
+                    missing_files.append(uf.name)
                     continue
 
             skip, enc = find_csv_data_start(path)
@@ -179,6 +210,14 @@ def load_csv_files(uploaded_files, start_mhz, end_mhz, is_isolation=False):
             s = pd.to_numeric(df_sel[col0], errors="coerce")
             s.name = strip_ext_label(uf.name)
             series_list.append(s)
+
+        if is_isolation and target_col_keyword and missing_files:
+            raise ValueError(
+                "以下檔案找不到包含「"
+                + target_col_keyword
+                + "」的欄位，請確認 CSV 內容或改用「自訂」關鍵字：\n"
+                + "、".join(missing_files)
+            )
 
         if not series_list:
             raise ValueError("沒有讀到有效資料。請確認 CSV 格式與頻率範圍。")
@@ -562,6 +601,26 @@ if uploaded_files:
         "已選擇：" + "、".join([f.name for f in uploaded_files])
     )
 
+# Isolation 專用：選擇要擷取的 S-parameter 欄位，避免抓錯 trace
+iso_col_keyword = "S12 Log Mag"
+
+if do_iso:
+    st.markdown("**Isolation 資料欄位**")
+    iso_col_choice = st.selectbox(
+        "選擇要從 CSV 擷取的欄位（依欄名關鍵字比對，不受欄位順序影響）",
+        ISO_COLUMN_PRESETS,
+        index=0,
+        help="請確認網路分析儀存檔時 Isolation 對應的是哪一個 S-parameter（例如 S12），"
+             "避免因存檔順序不同而誤抓到 S11。",
+    )
+    if iso_col_choice == "自訂...":
+        iso_col_keyword = st.text_input(
+            "自訂欄位關鍵字（大小寫不拘，例如 S12 Log Mag）",
+            value="S12 Log Mag",
+        )
+    else:
+        iso_col_keyword = iso_col_choice
+
 
 # ============================================================
 # 3. Frequency range
@@ -783,6 +842,9 @@ if run:
         if fstart >= fend:
             raise ValueError("Start 必須小於 End。")
 
+        if do_iso and not iso_col_keyword.strip():
+            raise ValueError("請輸入 Isolation 欄位關鍵字。")
+
         # SPEC
         specs = []
         for s, e, v in spec_rows:
@@ -828,6 +890,7 @@ if run:
                 fstart,
                 fend,
                 is_isolation=do_iso,
+                target_col_keyword=iso_col_keyword if do_iso else None,
             )
 
         df_combined = sanitize_df_columns(df_combined)
